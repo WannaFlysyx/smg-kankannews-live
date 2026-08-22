@@ -5,6 +5,8 @@
 // @version      2.5
 // @description  收看看看新闻相关内容
 // @match        *://*.kankanews.com/*
+// @updateURL    https://github.com/WannaFlysyx/smg-kankannews-live/raw/refs/heads/main/smg-wxty.user.js
+// @downloadURL  https://github.com/WannaFlysyx/smg-kankannews-live/raw/refs/heads/main/smg-wxty.user.js
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
