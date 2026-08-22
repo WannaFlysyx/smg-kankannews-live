@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         看看新闻直播一键播放版
 // @namespace    http://tampermonkey.net/
-// @author       https://github.com/WannaFlysyx         
-// @version      2.5.1
-// @description  收看看看新闻相关内容
+// @author       https://github.com/WannaFlysyx
+// @version      3.0
+// @description  收看看看新闻直播，支持回看当天已播节目和进度条拖动
 // @match        *://*.kankanews.com/*
 // @updateURL    https://github.com/WannaFlysyx/smg-kankannews-live/raw/refs/heads/main/smg-wxty.user.js
 // @downloadURL  https://github.com/WannaFlysyx/smg-kankannews-live/raw/refs/heads/main/smg-wxty.user.js
@@ -19,7 +19,7 @@
   const PUB_N = BigInt('0x' + N_HEX);
   const PUB_E = 65537n;
 
-  /* ========== RSA 解密 ========== */
+  /* ========== RSA 解密（保持不变） ========== */
   function modPow(base, exp, mod) {
     let result = 1n;
     base = base % mod;
@@ -52,7 +52,6 @@
   }
   function decryptLiveAddress(t) {
     if (!t || typeof t !== 'string') return '';
-    // 容错：处理 JSON 转义
     t = t.replace(/\\\//g, '/').replace(/\\/g, '').trim();
     const binary = atob(t);
     let hex = '';
@@ -75,46 +74,50 @@
     return new TextDecoder().decode(result);
   }
 
-  /* ========== 注入页面上下文：只递归查找 live_address ========== */
+  /* ========== 注入页面脚本（保持不变） ========== */
   function injectInterceptor() {
     const code = `
       (function() {
-        function findLiveAddress(obj, path, results) {
-          if (!obj || typeof obj !== 'object') return;
-          if (Array.isArray(obj)) {
-            obj.forEach((item, i) => findLiveAddress(item, path + '[' + i + ']', results));
-            return;
-          }
-          for (const key of Object.keys(obj)) {
-            const val = obj[key];
-            const currentPath = path ? path + '.' + key : key;
-            if (/^live_address$/i.test(key) && typeof val === 'string' && val.length > 0) {
-              results.push({ value: val, path: currentPath });
-            }
-            if (typeof val === 'object' && val !== null) {
-              findLiveAddress(val, currentPath, results);
-            }
-          }
+        function isUrlMatch(url, keyword) {
+          try { return new URL(url, location.href).pathname.includes(keyword); }
+          catch(e) { return String(url).includes(keyword); }
         }
 
-        function tryExtractLiveAddress(text) {
+        function processResponse(url, text) {
           if (typeof text !== 'string') return;
           try {
             const j = JSON.parse(text);
-            const matches = [];
-            findLiveAddress(j, '', matches);
-            if (matches.length > 0) {
-              window.postMessage({
-                source: 'kklive-interceptor',
-                type: 'live_address',
-                live_address: matches[0].value,
-                channel_name: '直播'
-              }, '*');
+            if (!j || j.code !== '1000' || !j.result) return;
+
+            if (isUrlMatch(url, '/channel/detail')) {
+              const liveAddress = j.result.live_address;
+              if (liveAddress && typeof liveAddress === 'string' && liveAddress.length > 0) {
+                window.postMessage({
+                  source: 'kklive-interceptor',
+                  type: 'channel_info',
+                  channel_id: j.result.id,
+                  channel_name: j.result.name,
+                  live_address: liveAddress
+                }, '*');
+              }
             }
-          } catch (e) {}
+
+            if (isUrlMatch(url, '/programs')) {
+              const programs = j.result.programs;
+              if (Array.isArray(programs) && programs.length > 0) {
+                window.postMessage({
+                  source: 'kklive-interceptor',
+                  type: 'program_list',
+                  channel_id: j.result.id,
+                  channel_name: j.result.name,
+                  date: j.result.date || '',
+                  programs: programs
+                }, '*');
+              }
+            }
+          } catch(e) {}
         }
 
-        // Hook XHR
         const origOpen = XMLHttpRequest.prototype.open;
         const origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
@@ -124,19 +127,18 @@
         XMLHttpRequest.prototype.send = function() {
           if (this._kklive_url) {
             this.addEventListener('load', function() {
-              tryExtractLiveAddress(this.responseText);
+              processResponse(this._kklive_url, this.responseText);
             });
           }
           return origSend.apply(this, arguments);
         };
 
-        // Hook fetch
         const origFetch = window.fetch;
         window.fetch = function(url, opts) {
           return origFetch.apply(this, arguments).then(function(resp) {
             const u = (typeof url === 'string') ? url : (url && url.url);
             if (u) {
-              resp.clone().text().then(tryExtractLiveAddress);
+              resp.clone().text().then(raw => processResponse(u, raw));
             }
             return resp;
           });
@@ -151,19 +153,52 @@
 
   injectInterceptor();
 
-  /* ========== 捕获直播地址 ========== */
+  /* ========== 内容脚本状态（保持不变） ========== */
   let capturedLive = null;
+  let decryptedLiveUrl = null;
   let capturedName = '';
+  let currentChannelId = null;
+  let programList = [];
+  let currentDate = '';
+
+  function getTodayStr() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return y + '-' + m + '-' + day;
+  }
 
   window.addEventListener('message', (e) => {
-    if (e.data && e.data.source === 'kklive-interceptor' && e.data.live_address) {
-      capturedLive = e.data.live_address;
-      capturedName = e.data.channel_name || '直播';
+    const data = e.data;
+    if (!data || data.source !== 'kklive-interceptor') return;
+
+    if (data.type === 'channel_info') {
+      capturedLive = data.live_address;
+      capturedName = data.channel_name || '直播';
+      currentChannelId = data.channel_id;
+      try {
+        decryptedLiveUrl = decryptLiveAddress(capturedLive);
+        console.log('[KKLive] 直播地址解密成功:', decryptedLiveUrl);
+      } catch (err) {
+        console.error('[KKLive] 直播地址解密失败:', err);
+        decryptedLiveUrl = null;
+      }
       updateButtonState();
+      updateChannelNameUI();
+    }
+
+    if (data.type === 'program_list') {
+      programList = data.programs || [];
+      currentDate = data.date || getTodayStr();
+      if (data.channel_name) capturedName = data.channel_name;
+      console.log('[KKLive] 捕获到节目列表，共', programList.length, '个节目，日期：', currentDate);
+      updateProgramListUI();
+      updateDateUI();
     }
   });
 
-  /* ========== 加载 hls.js ========== */
+  /* ========== 加载 hls.js（保持不变） ========== */
   function loadHls() {
     return new Promise((resolve, reject) => {
       if (window.Hls) return resolve(window.Hls);
@@ -175,39 +210,216 @@
     });
   }
 
-  /* ========== 极简 UI：悬浮按钮 + 简单面板 ========== */
+  /* ========== 🎨 美化的 UI 面板 ========== */
   let panel = null;
   let floatBtn = null;
 
   function createPanel() {
     if (panel) return panel;
+
     panel = document.createElement('div');
     panel.id = 'kklive-panel';
     panel.style.cssText = `
-      position: fixed; top: 20px; right: 20px; z-index: 999999;
-      width: 320px; background: #1a1a2e; color: #eee; border-radius: 12px;
-      box-shadow: 0 8px 32px rgba(0,0,0,.5); font-family: -apple-system, sans-serif;
-      font-size: 13px; overflow: hidden; border: 1px solid #333;
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 999999;
+      width: 400px;
+      max-height: 86vh;
+      background: rgba(20, 22, 36, 0.88);
+      backdrop-filter: blur(16px) saturate(180%);
+      -webkit-backdrop-filter: blur(16px) saturate(180%);
+      color: #f0f0f5;
+      border-radius: 20px;
+      box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.06);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transition: transform 0.25s ease, opacity 0.25s ease;
     `;
-    panel.innerHTML = `
-      <div style="padding:12px 16px; background:#16213e; display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-weight:600; font-size:14px;">🎬 看看直播播放器</span>
-        <span id="kklive-close" style="cursor:pointer; opacity:.6; font-size:18px; line-height:1;">×</span>
-      </div>
-      <video id="kklive-video" style="width:100%; display:none; background:#000;" controls playsinline></video>
-      <div id="kklive-status" style="padding:10px 14px; font-size:12px; opacity:.85; min-height:20px;"></div>
+
+    // 头部
+    const header = document.createElement('div');
+    header.style.cssText = `
+      padding: 14px 20px;
+      background: linear-gradient(145deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01));
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
     `;
+    header.innerHTML = `
+      <span style="font-weight: 600; font-size: 15px; letter-spacing: 0.3px; display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 18px;">📺</span> 看看播放器
+      </span>
+      <span id="kklive-close" style="cursor: pointer; opacity: 0.5; font-size: 20px; line-height: 1; transition: opacity 0.2s; padding: 0 4px;">✕</span>
+    `;
+    panel.appendChild(header);
+
+    // 频道信息行
+    const channelRow = document.createElement('div');
+    channelRow.style.cssText = `
+      padding: 8px 20px 6px 20px;
+      background: rgba(255,255,255,0.02);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    `;
+    channelRow.innerHTML = `
+      <span style="opacity:0.5;">📡</span>
+      <span id="kklive-channel-name" style="font-weight: 500;"></span>
+    `;
+    panel.appendChild(channelRow);
+
+    // 直播按钮
+    const liveBtnWrap = document.createElement('div');
+    liveBtnWrap.style.cssText = `padding: 10px 20px; border-bottom: 1px solid rgba(255,255,255,0.04);`;
+    const liveBtn = document.createElement('button');
+    liveBtn.id = 'kklive-live-btn';
+    liveBtn.textContent = '▶ 播放直播';
+    liveBtn.style.cssText = `
+      width: 100%;
+      padding: 10px 0;
+      background: linear-gradient(135deg, #34d399, #22d3ee);
+      color: #0c0e1a;
+      border: none;
+      border-radius: 40px;
+      font-weight: 700;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 14px rgba(52, 211, 153, 0.3);
+      letter-spacing: 0.3px;
+    `;
+    liveBtn.onmouseenter = () => { liveBtn.style.transform = 'scale(1.02)'; liveBtn.style.boxShadow = '0 6px 20px rgba(52, 211, 153, 0.4)'; };
+    liveBtn.onmouseleave = () => { liveBtn.style.transform = 'scale(1)'; liveBtn.style.boxShadow = '0 4px 14px rgba(52, 211, 153, 0.3)'; };
+    liveBtnWrap.appendChild(liveBtn);
+    panel.appendChild(liveBtnWrap);
+
+    // 节目单头部（日期 + 刷新）
+    const progHeader = document.createElement('div');
+    progHeader.style.cssText = `
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 20px 4px 20px;
+      background: rgba(255,255,255,0.02);
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    `;
+    progHeader.innerHTML = `
+      <span id="kklive-date" style="font-size: 12px; opacity: 0.6; letter-spacing: 0.2px;"></span>
+      <button id="kklive-refresh-btn" style="
+        background: rgba(255,255,255,0.06);
+        color: #d0d0e0;
+        border: none;
+        border-radius: 16px;
+        padding: 4px 14px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.2s;
+      ">🔄 刷新</button>
+    `;
+    panel.appendChild(progHeader);
+
+    // 节目列表容器（可滚动）
+    const listWrap = document.createElement('div');
+    listWrap.style.cssText = `
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px 12px 10px 12px;
+      background: rgba(0,0,0,0.15);
+      max-height: 360px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.15) transparent;
+    `;
+    // 自定义滚动条（webkit）
+    const styleScroll = document.createElement('style');
+    styleScroll.textContent = `
+      #kklive-panel ::-webkit-scrollbar { width: 4px; }
+      #kklive-panel ::-webkit-scrollbar-track { background: transparent; }
+      #kklive-panel ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+      #kklive-panel ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.35); }
+    `;
+    panel.appendChild(styleScroll);
+
+    const listEl = document.createElement('div');
+    listEl.id = 'kklive-program-list';
+    listEl.style.cssText = 'display: flex; flex-direction: column; gap: 4px;';
+    listWrap.appendChild(listEl);
+    panel.appendChild(listWrap);
+
+    // 视频播放器
+    const video = document.createElement('video');
+    video.id = 'kklive-video';
+    video.style.cssText = `
+      width: 100%;
+      display: none;
+      background: #000;
+      max-height: 200px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+    `;
+    video.controls = true;
+    video.playsInline = true;
+    panel.appendChild(video);
+
+    // 状态栏
+    const status = document.createElement('div');
+    status.id = 'kklive-status';
+    status.style.cssText = `
+      padding: 10px 20px;
+      font-size: 12px;
+      opacity: 0.8;
+      min-height: 22px;
+      background: rgba(0,0,0,0.2);
+      border-top: 1px solid rgba(255,255,255,0.04);
+      color: #c0c0d0;
+      letter-spacing: 0.2px;
+    `;
+    panel.appendChild(status);
+
     document.body.appendChild(panel);
 
+    // 事件绑定
     panel.querySelector('#kklive-close').onclick = () => {
-      if (panel.querySelector('#kklive-video')._hls) {
-        panel.querySelector('#kklive-video')._hls.destroy();
-      }
+      const videoEl = panel.querySelector('#kklive-video');
+      if (videoEl._hls) videoEl._hls.destroy();
       panel.remove();
       panel = null;
     };
 
+    panel.querySelector('#kklive-live-btn').onclick = () => playLive();
+
+    panel.querySelector('#kklive-refresh-btn').onclick = () => {
+      setStatus('💡 节目单由页面自动加载，可尝试刷新页面');
+      if (programList.length === 0) {
+        setStatus('⚠️ 未捕获到节目列表，请刷新页面后重试');
+      } else {
+        updateProgramListUI();
+        setStatus('✅ 节目单已更新');
+      }
+    };
+
+    updateChannelNameUI();
+    updateDateUI();
+    updateProgramListUI();
     return panel;
+  }
+
+  /* ========== UI 更新辅助函数 ========== */
+  function updateChannelNameUI() {
+    if (!panel) return;
+    const nameEl = panel.querySelector('#kklive-channel-name');
+    if (nameEl) nameEl.textContent = capturedName || '未知频道';
+  }
+
+  function updateDateUI() {
+    if (!panel) return;
+    const dateEl = panel.querySelector('#kklive-date');
+    if (dateEl) dateEl.textContent = currentDate ? '📅 ' + currentDate : getTodayStr();
   }
 
   function setStatus(msg) {
@@ -218,54 +430,145 @@
 
   function updateButtonState() {
     if (!floatBtn) return;
-    if (capturedLive) {
-      floatBtn.textContent = '▶ 播放直播（已就绪）';
-      floatBtn.style.background = '#4ade80';
-      floatBtn.style.color = '#000';
+    if (decryptedLiveUrl || capturedLive) {
+      floatBtn.textContent = '▶ 直播就绪';
+      floatBtn.style.background = 'linear-gradient(135deg, #34d399, #22d3ee)';
+      floatBtn.style.color = '#0c0e1a';
+      floatBtn.style.boxShadow = '0 6px 24px rgba(52, 211, 153, 0.4)';
     } else {
-      floatBtn.textContent = '▶ 直播播放';
-      floatBtn.style.background = '#e94560';
-      floatBtn.style.color = '#fff';
+      floatBtn.textContent = '⏳ 加载中...';
+      floatBtn.style.background = 'rgba(255,255,255,0.08)';
+      floatBtn.style.color = '#aaa';
+      floatBtn.style.boxShadow = 'none';
     }
   }
 
-  function init() {
-    // 创建悬浮按钮
+  function updateProgramListUI() {
+    if (!panel) return;
+    const listEl = panel.querySelector('#kklive-program-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+
+    if (programList.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = `
+        padding: 24px 12px;
+        text-align: center;
+        opacity: 0.4;
+        font-size: 13px;
+        letter-spacing: 0.3px;
+      `;
+      empty.textContent = '📭 暂无节目数据，请等待页面加载';
+      listEl.appendChild(empty);
+      return;
+    }
+
+    programList.forEach(prog => {
+      const btn = document.createElement('button');
+      const start = prog.start_time_string ? prog.start_time_string.slice(11, 16) : '';
+      const end = prog.end_time_string ? prog.end_time_string.slice(11, 16) : '';
+      btn.textContent = `${prog.name}  ${start} - ${end}`;
+      btn.style.cssText = `
+        width: 100%;
+        padding: 8px 12px;
+        background: rgba(255,255,255,0.04);
+        color: #e8e8f0;
+        border: none;
+        border-radius: 12px;
+        cursor: pointer;
+        text-align: left;
+        font-size: 12.5px;
+        transition: all 0.15s ease;
+        font-weight: 450;
+        letter-spacing: 0.1px;
+      `;
+      btn.onmouseenter = () => { btn.style.background = 'rgba(255,255,255,0.10)'; btn.style.transform = 'translateX(2px)'; };
+      btn.onmouseleave = () => { btn.style.background = 'rgba(255,255,255,0.04)'; btn.style.transform = 'translateX(0)'; };
+      btn.onclick = () => playReplay(prog);
+      listEl.appendChild(btn);
+    });
+  }
+
+  /* ========== 浮动按钮（美化） ========== */
+  function initFloatBtn() {
+    if (floatBtn) return;
     floatBtn = document.createElement('button');
-    floatBtn.textContent = '▶ 直播播放';
+    floatBtn.textContent = '▶ 直播';
     floatBtn.style.cssText = `
-      position: fixed; bottom: 20px; right: 20px; z-index: 999998;
-      padding: 10px 18px; background: #e94560; color: #fff; border: none;
-      border-radius: 20px; font-size: 13px; font-weight: 600; cursor: pointer;
-      box-shadow: 0 4px 16px rgba(233,69,96,.4); font-family: -apple-system, sans-serif;
-      transition: all .2s;
+      position: fixed;
+      bottom: 28px;
+      right: 28px;
+      z-index: 999998;
+      padding: 12px 24px;
+      background: linear-gradient(135deg, #34d399, #22d3ee);
+      color: #0c0e1a;
+      border: none;
+      border-radius: 40px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 8px 28px rgba(52, 211, 153, 0.35);
+      transition: all 0.25s ease;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      letter-spacing: 0.3px;
+      backdrop-filter: blur(4px);
+      border: 1px solid rgba(255,255,255,0.08);
     `;
+    floatBtn.onmouseenter = () => {
+      floatBtn.style.transform = 'scale(1.06)';
+      floatBtn.style.boxShadow = '0 12px 36px rgba(52, 211, 153, 0.5)';
+    };
+    floatBtn.onmouseleave = () => {
+      floatBtn.style.transform = 'scale(1)';
+      floatBtn.style.boxShadow = '0 8px 28px rgba(52, 211, 153, 0.35)';
+    };
     floatBtn.onclick = () => {
       createPanel();
-      if (capturedLive) {
-        doPlay(capturedLive, capturedName);
+      if (decryptedLiveUrl) {
+        playLive();
       } else {
-        setStatus('⏳ 正在等待直播地址，请刷新页面或稍后再试');
+        setStatus('⏳ 等待直播地址，请刷新页面或稍后重试');
       }
     };
     document.body.appendChild(floatBtn);
     updateButtonState();
   }
 
-  /* ========== 播放主流程 ========== */
+  /* ========== 播放功能（保持不变） ========== */
+  function playLive() {
+    createPanel();
+    if (!decryptedLiveUrl) {
+      setStatus('❌ 直播地址未就绪，请刷新页面重试');
+      return;
+    }
+    doPlay(decryptedLiveUrl, capturedName || '直播');
+  }
+
+  function playReplay(program) {
+    createPanel();
+    if (!decryptedLiveUrl) {
+      setStatus('❌ 未获取到频道直播地址，无法回放');
+      return;
+    }
+    let url = decryptedLiveUrl;
+    if (/\.m3u8/.test(url) && program.start_time && program.end_time) {
+      const sep = url.includes('?') ? '&' : '?';
+      url += `${sep}start=${program.start_time}&end=${program.end_time}`;
+    }
+    const title = program.name || '回放';
+    setStatus('⏳ 加载回放：' + title);
+    doPlay(url, title);
+  }
+
   async function doPlay(input, name) {
     createPanel();
     setStatus('正在处理地址...');
 
-    let url;
-    if (/^https?:\/\//i.test(input)) {
-      // 明文地址直接播放
-      url = input;
-      setStatus('✅ 检测到直接播放地址，加载中...');
-    } else {
-      setStatus('🔐 正在解密 live_address...');
+    let url = input;
+    if (!/^https?:\/\//i.test(url)) {
+      setStatus('🔐 解密中...');
       try {
-        url = decryptLiveAddress(input);
+        url = decryptLiveAddress(url);
       } catch (e) {
         setStatus('❌ 解密失败：' + e.message);
         return;
@@ -275,6 +578,8 @@
         return;
       }
       setStatus('✅ 解密成功，加载播放器...');
+    } else {
+      setStatus('✅ 加载播放器...');
     }
 
     const video = panel.querySelector('#kklive-video');
@@ -308,10 +613,10 @@
     }
   }
 
-  /* ========== 页面加载完成后初始化按钮 ========== */
+  /* ========== 初始化 ========== */
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', initFloatBtn);
   } else {
-    init();
+    initFloatBtn();
   }
 })();
