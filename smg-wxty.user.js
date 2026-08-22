@@ -2,7 +2,7 @@
 // @name         看看新闻直播一键播放版
 // @namespace    http://tampermonkey.net/
 // @author       https://github.com/WannaFlysyx         
-// @version      2.5
+// @version      2.5.1
 // @description  收看看看新闻相关内容
 // @match        *://*.kankanews.com/*
 // @updateURL    https://github.com/WannaFlysyx/smg-kankannews-live/raw/refs/heads/main/smg-wxty.user.js
