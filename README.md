@@ -1,4 +1,4 @@
-# smg‑kankannews‑live （2026意大利站已失效！！）
+# smg‑kankannews‑live 2026意大利站已失效！！
 看看新闻直播一键播放版
 
 > 本脚本提供另一种实现思路，实现看看新闻直播页面一键自动播放视频。详细示例参考：[Popukok/smg_live](https://github.com/Popukok/smg_live)
